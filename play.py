@@ -1,153 +1,190 @@
 import pygame
 import torch
-import torch.nn as nn
-import random
 import os
-import time
+import math
+import random
+import numpy as np
+import torch.nn as nn
 
-# ---- Game Constants ----
+# ==== Game Settings ====
 GRID_SIZE = 64
 CELL_SIZE = 10
-WIDTH = GRID_SIZE * CELL_SIZE
-HEIGHT = GRID_SIZE * CELL_SIZE
+WIDTH, HEIGHT = GRID_SIZE * CELL_SIZE, GRID_SIZE * CELL_SIZE
+FPS = 15  # Spielgeschwindigkeit
 
-# ---- DQN Modell ----
-class DQN(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size):
-        super(DQN, self).__init__()
-        self.fc1 = nn.Linear(input_size, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, hidden_size)
-        self.fc3 = nn.Linear(hidden_size, output_size)
-        
+# ==== Dueling DQN ====
+class DuelingDQN(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.value = nn.Linear(hidden_dim, 1)
+        self.advantage = nn.Linear(hidden_dim, output_dim)
+
     def forward(self, x):
         x = torch.relu(self.fc1(x))
-        x = torch.relu(self.fc2(x))
-        return self.fc3(x)
+        v = self.value(x)
+        a = self.advantage(x)
+        return v + a - a.mean(dim=1, keepdim=True)
 
-# ---- Snake Game ----
+# ==== Snake Game ====
 class SnakeGame:
-    def __init__(self):
-        pygame.init()
-        self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
-        pygame.display.set_caption("Snake AI - Play Mode")
-        self.clock = pygame.time.Clock()
-        self.font = pygame.font.SysFont('Arial', 20)
+    def __init__(self, render=True):
+        self.render = render
+        if render:
+            pygame.init()
+            self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
+            pygame.display.set_caption("Snake AI - Play Mode")
+            self.clock = pygame.time.Clock()
+            self.font = pygame.font.SysFont('Arial', 20)
         self.reset()
-        
+
     def reset(self):
-        start_x = random.randint(10, GRID_SIZE-10)
-        start_y = random.randint(10, GRID_SIZE-10)
-        self.snake = [(start_x, start_y)]
-        self.direction = random.choice([(0, 1), (0, -1), (1, 0), (-1, 0)])
+        self.snake = [(random.randint(10, GRID_SIZE-10), random.randint(10, GRID_SIZE-10))]
+        self.direction = random.choice([(0,1), (0,-1), (1,0), (-1,0)])
         self.food = self.spawn_food()
-        self.score = 0
         self.steps = 0
-        self.draw()
+        self.score = 0
         return self.get_state()
-    
+
     def spawn_food(self):
         while True:
-            food = (random.randint(0, GRID_SIZE-1), random.randint(0, GRID_SIZE-1))
-            if food not in self.snake:
-                return food
-    
+            f = (random.randint(0, GRID_SIZE-1), random.randint(0, GRID_SIZE-1))
+            if f not in self.snake:
+                return f
+
     def check_collision(self, pos):
         x, y = pos
-        return x < 0 or x >= GRID_SIZE or y < 0 or y >= GRID_SIZE or pos in self.snake
-    
+        return x < 0 or y < 0 or x >= GRID_SIZE or y >= GRID_SIZE or pos in self.snake
+
+    def get_valid_actions(self):
+        dirs = [(0,1), (0,-1), (1,0), (-1,0)]
+        valid = []
+        for i, nd in enumerate(dirs):
+            if (nd[0] + self.direction[0], nd[1] + self.direction[1]) == (0,0):
+                continue
+            new = (self.snake[0][0] + nd[0], self.snake[0][1] + nd[1])
+            if not self.check_collision(new):
+                valid.append(i)
+        return valid
+
     def get_state(self):
-        head_x, head_y = self.snake[0]
-        food_x, food_y = self.food
-        dx = food_x - head_x
-        dy = food_y - head_y
+        head = self.snake[0]
+        x, y = head
+        fx, fy = self.food
+        dir_x, dir_y = self.direction
+        dist_x = fx - x
+        dist_y = fy - y
+        euclid = math.hypot(dist_x, dist_y)
+
+        front = (x + dir_x, y + dir_y)
+        left = (x - dir_y, y + dir_x)
+        right = (x + dir_y, y - dir_x)
+        danger_front = self.check_collision(front)
+        danger_left  = self.check_collision(left)
+        danger_right = self.check_collision(right)
+
+        def free_distance(dx, dy):
+            dist = 0
+            cx, cy = x, y
+            while 0 <= cx+dx < GRID_SIZE and 0 <= cy+dy < GRID_SIZE and (cx+dx, cy+dy) not in self.snake:
+                cx += dx
+                cy += dy
+                dist += 1
+            return dist / GRID_SIZE
+
         state = [
-            head_x / GRID_SIZE,
-            head_y / GRID_SIZE,
-            dx / GRID_SIZE,
-            dy / GRID_SIZE,
-            self.direction[0],
-            self.direction[1],
-            int(self.check_collision((head_x + 1, head_y))),
-            int(self.check_collision((head_x - 1, head_y))),
-            int(self.check_collision((head_x, head_y + 1))),
-            int(self.check_collision((head_x, head_y - 1))),
-            int((head_x + 1, head_y) in self.snake),
-            int((head_x - 1, head_y) in self.snake),
-            int((head_x, head_y + 1) in self.snake),
-            int((head_x, head_y - 1) in self.snake)
+            danger_front,
+            danger_left,
+            danger_right,
+            dir_x, dir_y,
+            dist_x / GRID_SIZE,
+            dist_y / GRID_SIZE,
+            euclid / (math.sqrt(2) * GRID_SIZE),
+            free_distance(0, -1),
+            free_distance(0, 1),
+            free_distance(-1, 0),
+            free_distance(1, 0)
         ]
         return torch.FloatTensor(state)
-    
-    def draw(self):
-        self.screen.fill((0, 0, 0))
-        for i, segment in enumerate(self.snake):
-            x, y = segment
-            color = (0, 255, 0) if i == 0 else (0, 200, 0)
-            pygame.draw.rect(self.screen, color, (x*CELL_SIZE, y*CELL_SIZE, CELL_SIZE, CELL_SIZE))
-        fx, fy = self.food
-        pygame.draw.rect(self.screen, (255, 0, 0), (fx*CELL_SIZE, fy*CELL_SIZE, CELL_SIZE, CELL_SIZE))
-        score_text = self.font.render(f'Score: {self.score}', True, (255, 255, 255))
-        self.screen.blit(score_text, (10, 10))
-        pygame.display.flip()
-        self.clock.tick(0)
 
     def step(self, action):
         self.steps += 1
-        directions = [(0, 1), (0, -1), (1, 0), (-1, 0)]
-        new_dir = directions[action]
-        if (new_dir[0] + self.direction[0], new_dir[1] + self.direction[1]) != (0, 0):
-            self.direction = new_dir
+        dirs = [(0,1), (0,-1), (1,0), (-1,0)]
+        nd = dirs[action]
+        if (nd[0] + self.direction[0], nd[1] + self.direction[1]) != (0,0):
+            self.direction = nd
         new_head = (self.snake[0][0] + self.direction[0], self.snake[0][1] + self.direction[1])
-        if self.check_collision(new_head) or self.steps > 100 * len(self.snake):
-            return None, -10, True
+        if self.check_collision(new_head) or self.steps > 300 * len(self.snake):
+            return None, -100, True
         self.snake.insert(0, new_head)
         if new_head == self.food:
             self.score += 1
             self.food = self.spawn_food()
-            reward = 10
         else:
             self.snake.pop()
-            reward = -0.1
-        self.draw()
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                pygame.quit()
-                return None, 0, True
-        return self.get_state(), reward, False
 
-# ---- Load Model ----
-def load_latest_model():
-    checkpoint_dir = "checkpoints"
-    files = [f for f in os.listdir(checkpoint_dir) if f.startswith("checkpoint_")]
-    if not files:
-        raise Exception("❌ Kein Checkpoint gefunden!")
-    latest = max(files, key=lambda x: int(x.split("_")[1].split(".")[0]))
-    checkpoint = torch.load(f"{checkpoint_dir}/{latest}")
-    print(f"[✅] Geladen: {latest}")
-    model = DQN(14, 128, 4)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
-    return model
+        if self.render:
+            self._draw()
+        return self.get_state(), 0, False
 
-# ---- Play ----
-def play():
-    model = load_latest_model()
-    game = SnakeGame()
+    def _draw(self):
+        self.screen.fill((0,0,0))
+        for i,(x,y) in enumerate(self.snake):
+            color = (0,255,0) if i==0 else (0,200,0)
+            pygame.draw.rect(self.screen, color, (x*CELL_SIZE, y*CELL_SIZE, CELL_SIZE, CELL_SIZE))
+        fx, fy = self.food
+        pygame.draw.rect(self.screen, (255,0,0), (fx*CELL_SIZE, fy*CELL_SIZE, CELL_SIZE, CELL_SIZE))
+        self.screen.blit(self.font.render(f'Score: {self.score}', True, (255,255,255)), (10,10))
+        pygame.display.flip()
+        self.clock.tick(FPS)
+
+# ==== Agent ====
+class DQNAgent:
+    def __init__(self):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        dummy_env = SnakeGame(render=False)
+        input_dim = len(dummy_env.get_state())
+        self.model = DuelingDQN(input_dim, 128, 4).to(self.device)
+        self.load_checkpoint()
+
+    def act(self, state):
+        valid_actions = SnakeGame(render=False).get_valid_actions()
+        st = state.to(self.device)
+        with torch.no_grad():
+            q_vals = self.model(st.unsqueeze(0)).squeeze().cpu().numpy()
+        mask = np.full_like(q_vals, -np.inf)
+        mask[valid_actions] = q_vals[valid_actions]
+        return int(np.argmax(mask))
+
+    def load_checkpoint(self):
+        try:
+            files = [f for f in os.listdir('checkpoints') if f.startswith('ckpt_')]
+            if not files:
+                raise Exception("Kein Checkpoint gefunden.")
+            latest = max(files, key=lambda x: int(x.split('_')[1].split('.')[0]))
+            path = os.path.join('checkpoints', latest)
+            print(f"[📂] Lade Checkpoint: {path}")
+            ck = torch.load(path, map_location=self.device)
+            self.model.load_state_dict(ck['model'])
+            print(f"[✅] Modell geladen – Letzter Checkpoint: {latest}")
+        except Exception as e:
+            print(f"[❌] Fehler beim Laden des Checkpoints: {e}")
+            exit()
+
+# ==== Run ====
+if __name__ == '__main__':
+    game = SnakeGame(render=True)
+    agent = DQNAgent()
     while True:
         state = game.reset()
         done = False
         while not done:
-            with torch.no_grad():
-                q_values = model(state)
-                action = torch.argmax(q_values).item()
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit()
+                    exit()
+            action = agent.act(state)
             next_state, _, done = game.step(action)
             if next_state is None:
                 break
             state = next_state
-            time.sleep(0.1)
-        print(f"[🏁] Spiel beendet. Score: {game.score}")
-        time.sleep(2)
-
-if __name__ == "__main__":
-    play()
-
